@@ -355,51 +355,53 @@ if mode == "Только расчет выходных параметров":
         file_name="hvp2_calculated_outputs.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
 else:
     y_true_raw = df_valid[y_true_col]
+
     if y_true_raw.dtype == object:
         y_true_raw = (
             y_true_raw.astype(str)
             .str.replace(",", ".", regex=False)
             .str.replace(" ", "", regex=False)
+            .str.replace("\u00a0", "", regex=False)
         )
+
     y_true = pd.to_numeric(y_true_raw, errors="coerce").to_numpy(dtype=float)
 
     mask_y = ~np.isnan(y_true)
     y_true = y_true[mask_y]
     model_df_for_y = model_df.loc[mask_y].copy()
 
-# Добавляем фактический Y во внутреннюю таблицу,
-# чтобы функция adapt_one могла его найти.
-model_df_for_y["_Y_EXP_"] = y_true
+    # Добавляем фактический Y во внутреннюю таблицу,
+    # чтобы функция adapt_one могла его найти.
+    model_df_for_y["_Y_EXP_"] = y_true
 
-y_before = model.predict_one(model_df_for_y, selected_y)
+    y_before = model.predict_one(model_df_for_y, selected_y)
 
-summary_before = {
-    "MAPE_before_percent": mape_percent(y_true, y_before),
-    "max_error_before_percent": float(np.max(relative_error_percent(y_true, y_before))),
-}
+    summary_before = {
+        "MAPE_before_percent": mape_percent(y_true, y_before),
+        "max_error_before_percent": float(np.max(relative_error_percent(y_true, y_before))),
+    }
 
-adapt_summary = model.adapt_one(
-    model_df_for_y,
-    selected_y,
-    y_true_col="_Y_EXP_",
-    alpha=alpha,
-    threshold_percent=threshold
-)
+    adapt_summary = model.adapt_one(
+        model_df_for_y,
+        selected_y,
+        y_true_col="_Y_EXP_",
+        alpha=alpha,
+        threshold_percent=threshold
+    )
 
-y_after = model.predict_one(model_df_for_y, selected_y)
+    y_after = model.predict_one(model_df_for_y, selected_y)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("MAPE до, %", f"{summary_before['MAPE_before_percent']:.3f}")
-c2.metric("MAPE после, %", f"{adapt_summary['MAPE_after_percent']:.3f}")
-c3.metric("K0 до", f"{adapt_summary['k0_before']:.6f}")
-c4.metric("K0 после", f"{adapt_summary['k0_after']:.6f}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("MAPE до, %", f"{summary_before['MAPE_before_percent']:.3f}")
+    c2.metric("MAPE после, %", f"{adapt_summary['MAPE_after_percent']:.3f}")
+    c3.metric("K0 до", f"{adapt_summary['k0_before']:.6f}")
+    c4.metric("K0 после", f"{adapt_summary['k0_after']:.6f}")
 
-if adapt_summary["adapted"]:
+    if adapt_summary["adapted"]:
         st.success("Модель была адаптирована, так как погрешность превышала допустимый порог.")
-else:
+    else:
         st.info("Адаптация не выполнялась: погрешность не превышает заданный порог.")
 
     st.subheader("Графики")
