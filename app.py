@@ -389,7 +389,7 @@ adapt_summary = model.adapt_one(
     threshold_percent=threshold
 )
 
-    y_after = model.predict_one(model_df_for_y, selected_y)
+y_after = model.predict_one(model_df_for_y, selected_y)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("MAPE до, %", f"{summary_before['MAPE_before_percent']:.3f}")
