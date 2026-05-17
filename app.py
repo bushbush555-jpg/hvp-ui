@@ -37,16 +37,34 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
 
 
 def to_numeric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Аккуратное преобразование числовых столбцов.
+    Столбцы, которые не удалось преобразовать в числа, остаются без изменений.
+    """
     out = df.copy()
+
     for col in out.columns:
-        if out[col].dtype == object:
-            out[col] = (
-                out[col]
-                .astype(str)
+        original = out[col]
+
+        if original.dtype == object:
+            prepared = (
+                original.astype(str)
                 .str.replace(",", ".", regex=False)
                 .str.replace(" ", "", regex=False)
+                .str.replace("\u00a0", "", regex=False)
             )
-        out[col] = pd.to_numeric(out[col], errors="ignore")
+        else:
+            prepared = original
+
+        converted = pd.to_numeric(prepared, errors="coerce")
+
+        # Если в столбце реально есть числовые значения — используем преобразованный вариант.
+        # Если весь столбец стал NaN, оставляем исходный столбец.
+        if converted.notna().sum() > 0:
+            out[col] = converted
+        else:
+            out[col] = original
+
     return out
 
 
@@ -352,20 +370,24 @@ else:
     y_true = y_true[mask_y]
     model_df_for_y = model_df.loc[mask_y].copy()
 
-    y_before = model.predict_one(model_df_for_y, selected_y)
+# Добавляем фактический Y во внутреннюю таблицу,
+# чтобы функция adapt_one могла его найти.
+model_df_for_y["_Y_EXP_"] = y_true
 
-    summary_before = {
-        "MAPE_before_percent": mape_percent(y_true, y_before),
-        "max_error_before_percent": float(np.max(relative_error_percent(y_true, y_before))),
-    }
+y_before = model.predict_one(model_df_for_y, selected_y)
 
-    adapt_summary = model.adapt_one(
-        model_df_for_y,
-        selected_y,
-        y_true_col=y_true_col,
-        alpha=alpha,
-        threshold_percent=threshold
-    )
+summary_before = {
+    "MAPE_before_percent": mape_percent(y_true, y_before),
+    "max_error_before_percent": float(np.max(relative_error_percent(y_true, y_before))),
+}
+
+adapt_summary = model.adapt_one(
+    model_df_for_y,
+    selected_y,
+    y_true_col="_Y_EXP_",
+    alpha=alpha,
+    threshold_percent=threshold
+)
 
     y_after = model.predict_one(model_df_for_y, selected_y)
 
