@@ -391,11 +391,11 @@ adapt_summary = model.adapt_one(
 
 y_after = model.predict_one(model_df_for_y, selected_y)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("MAPE до, %", f"{summary_before['MAPE_before_percent']:.3f}")
-    c2.metric("MAPE после, %", f"{adapt_summary['MAPE_after_percent']:.3f}")
-    c3.metric("K0 до", f"{adapt_summary['k0_before']:.6f}")
-    c4.metric("K0 после", f"{adapt_summary['k0_after']:.6f}")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("MAPE до, %", f"{summary_before['MAPE_before_percent']:.3f}")
+c2.metric("MAPE после, %", f"{adapt_summary['MAPE_after_percent']:.3f}")
+c3.metric("K0 до", f"{adapt_summary['k0_before']:.6f}")
+c4.metric("K0 после", f"{adapt_summary['k0_after']:.6f}")
 
     if adapt_summary["adapted"]:
         st.success("Модель была адаптирована, так как погрешность превышала допустимый порог.")
