@@ -1,88 +1,381 @@
 import json
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score
 
 
 def mape_percent(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    y_true = np.asarray(y_true).reshape(-1)
-    y_pred = np.asarray(y_pred).reshape(-1)
+    """Средняя относительная погрешность, %."""
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
     denom = np.maximum(np.abs(y_true), 1e-9)
     return float(np.mean(np.abs((y_pred - y_true) / denom)) * 100.0)
 
 
-def fit_polynomial(df: pd.DataFrame, x_cols: List[str], y_col: str, degree: int = 2):
-    X = df[x_cols].to_numpy(dtype=float)
-    y = df[y_col].to_numpy(dtype=float)
-
-    poly = PolynomialFeatures(degree=degree, include_bias=True)
-    Phi = poly.fit_transform(X)
-    feature_names = poly.get_feature_names_out([f"X{i+1}" for i in range(X.shape[1])]).tolist()
-
-    lr = LinearRegression(fit_intercept=False)
-    lr.fit(Phi, y)
-    y_pred = lr.predict(Phi)
-
-    report = {
-        "y_name": y_col,
-        "x_cols": x_cols,
-        "degree": int(degree),
-        "feature_names": feature_names,
-        "coef": lr.coef_.tolist(),
-        "r2": float(r2_score(y, y_pred)),
-        "mape": float(mape_percent(y, y_pred)),
-        "n_rows": int(len(df)),
-    }
-    return report, y, y_pred
+def relative_error_percent(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    """Относительная погрешность по каждой точке, %."""
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    denom = np.maximum(np.abs(y_true), 1e-9)
+    return np.abs((y_pred - y_true) / denom) * 100.0
 
 
-def export_json_bytes(report: dict) -> bytes:
-    return json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+@dataclass
+class LinearModelSpec:
+    """
+    Расчетная модель одного выходного параметра:
+
+    Y = K0 + k1*X1 + k2*X2 + ... + kn*Xn
+
+    В Simulink каждый коэффициент k дополнительно представлен
+    в виде передаточной функции k/(Ts+1).
+    """
+
+    y_name: str
+    title: str
+    x_vars: List[str]
+    coef: List[float]
+    k0: float
+    tau: float
+    unit: str = ""
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        missing = [x for x in self.x_vars if x not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Для модели {self.y_name} отсутствуют столбцы: {missing}"
+            )
+
+        X = df[self.x_vars].to_numpy(dtype=float)
+        k = np.asarray(self.coef, dtype=float)
+
+        if X.shape[1] != len(k):
+            raise ValueError(
+                f"Для {self.y_name}: число входов {X.shape[1]} "
+                f"не совпадает с числом коэффициентов {len(k)}"
+            )
+
+        return self.k0 + X @ k
+
+    def adapt_k0(self, y_true: np.ndarray, y_pred: np.ndarray, alpha: float) -> float:
+        """
+        Адаптация свободного коэффициента:
+
+        K0_new = K0_old + alpha * mean(Yexp - Ycalc)
+
+        Такой вариант не меняет коэффициенты при технологических входах,
+        а только корректирует смещение модели.
+        """
+        y_true = np.asarray(y_true, dtype=float).reshape(-1)
+        y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+
+        correction = float(np.mean(y_true - y_pred))
+        self.k0 = float(self.k0 + alpha * correction)
+        return self.k0
 
 
-def export_py_bytes(report: dict) -> bytes:
-    y_name = report["y_name"]
-    x_cols = report["x_cols"]
-    degree = report["degree"]
-    feature_names = report["feature_names"]
-    coef = report["coef"]
+class HVP2DigitalModel:
+    """Много-выходная расчетная модель ХВП-2."""
 
-    py_text = f'''"""
-Автосгенерированная модель (полином степени {degree}) для выхода: {y_name}
-Входы X (в порядке): {x_cols}
-"""
+    def __init__(self, models: List[LinearModelSpec]):
+        self.models = models
+        self.by_name = {m.y_name: m for m in models}
 
-import numpy as np
+    def get_model(self, y_name: str) -> LinearModelSpec:
+        if y_name not in self.by_name:
+            raise KeyError(f"Модель {y_name} не найдена")
+        return self.by_name[y_name]
 
-Y_NAME = {repr(y_name)}
-X_COLS = {repr(x_cols)}
-DEGREE = {int(degree)}
-FEATURE_NAMES = {repr(feature_names)}
-COEF = np.array({repr(coef)}, dtype=float)
+    def predict_all(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Расчет всех выходов Y1...Y18.
 
-def _poly_features(X):
-    X = np.asarray(X, dtype=float)
-    n, p = X.shape
-    feats = [np.ones((n, 1))]
-    feats.append(X)
+        Важно: Y18 зависит от уже рассчитанных Y8, Y15, Y16, Y17,
+        поэтому модели рассчитываются последовательно.
+        """
+        work = df.copy()
+        result = pd.DataFrame(index=df.index)
 
-    if DEGREE >= 2:
-        feats.append(X**2)
-        cross = []
-        for i in range(p):
-            for j in range(i+1, p):
-                cross.append((X[:, i] * X[:, j]).reshape(-1, 1))
-        if cross:
-            feats.append(np.hstack(cross))
-    return np.hstack(feats)
+        for model in self.models:
+            y_calc = model.predict(work)
+            work[model.y_name] = y_calc
+            result[model.y_name] = y_calc
 
-def predict(X):
-    Phi = _poly_features(X)
-    return Phi @ COEF
-'''
-    return py_text.encode("utf-8")
+        return result
+
+    def predict_one(self, df: pd.DataFrame, y_name: str) -> np.ndarray:
+        """
+        Расчет одного выхода.
+
+        Если выбран Y18, предварительно рассчитываются выходы,
+        от которых зависит индекс качества.
+        """
+        if y_name == "Y18_Qualityindex":
+            all_y = self.predict_all(df)
+            return all_y[y_name].to_numpy(dtype=float)
+
+        model = self.get_model(y_name)
+        return model.predict(df)
+
+    def evaluate_one(
+        self,
+        df: pd.DataFrame,
+        y_name: str,
+        y_true_col: str
+    ) -> Dict:
+        model = self.get_model(y_name)
+        y_true = df[y_true_col].to_numpy(dtype=float)
+        y_pred = self.predict_one(df, y_name)
+
+        return {
+            "Y": y_name,
+            "title": model.title,
+            "unit": model.unit,
+            "tau": model.tau,
+            "k0": model.k0,
+            "n_rows": int(len(df)),
+            "MAPE_percent": mape_percent(y_true, y_pred),
+            "max_error_percent": float(np.max(relative_error_percent(y_true, y_pred))),
+            "mean_Y_exp": float(np.mean(y_true)),
+            "mean_Y_calc": float(np.mean(y_pred)),
+        }
+
+    def adapt_one(
+        self,
+        df: pd.DataFrame,
+        y_name: str,
+        y_true_col: str,
+        alpha: float = 0.2,
+        threshold_percent: float = 5.0
+    ) -> Dict:
+        model = self.get_model(y_name)
+
+        y_true = df[y_true_col].to_numpy(dtype=float)
+        y_pred_before = self.predict_one(df, y_name)
+
+        k0_before = model.k0
+        mape_before = mape_percent(y_true, y_pred_before)
+
+        adapted = False
+        if mape_before > threshold_percent:
+            model.adapt_k0(y_true, y_pred_before, alpha=alpha)
+            adapted = True
+
+        y_pred_after = self.predict_one(df, y_name)
+        mape_after = mape_percent(y_true, y_pred_after)
+
+        return {
+            "Y": y_name,
+            "title": model.title,
+            "unit": model.unit,
+            "k0_before": k0_before,
+            "k0_after": model.k0,
+            "MAPE_before_percent": mape_before,
+            "MAPE_after_percent": mape_after,
+            "adapted": adapted,
+            "threshold_percent": threshold_percent,
+            "alpha": alpha,
+        }
+
+    def to_json_bytes(self) -> bytes:
+        data = {"models": [asdict(m) for m in self.models]}
+        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+INPUT_INFO = {
+    "X1_Qfeed": "Расход исходной воды",
+    "X2_Pfeed": "Давление исходной воды",
+    "X3_TafterHX": "Температура после теплообменника",
+    "X4_TurbUFin": "Мутность перед ультрафильтрацией",
+    "X5_CondUOO2in": "Электропроводность на входе УОО",
+    "X6_DoseAS": "Дозирование антискаланта",
+    "X7_DoseMBS": "Дозирование MBS",
+    "X8_DoseNaOCl": "Дозирование NaOCl",
+    "X9_DoseNaOH": "Дозирование NaOH",
+    "X10_DoseHCl": "Дозирование HCl",
+    "X11_UFwashpressure": "Давление промывки УФ",
+    "X12_ROHPspeed": "Скорость насосов УОО",
+}
+
+
+def create_default_hvp2_model() -> HVP2DigitalModel:
+    """
+    Актуальная структура моделей Y1...Y18.
+
+    Коэффициенты соответствуют последней расчетной части и схемам Simulink.
+    Если в Word/Approx будут изменены коэффициенты, править нужно здесь.
+    """
+
+    models = [
+        LinearModelSpec(
+            y_name="Y1_dPstrainer",
+            title="Перепад давления на фильтре-ловушке",
+            x_vars=["X1_Qfeed", "X2_Pfeed", "X4_TurbUFin"],
+            coef=[0.0008448, 0.3504618424945, 0.01084691183008],
+            k0=-0.278050903768218,
+            tau=15,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y2_dPdisk",
+            title="Перепад давления на дисковом фильтре",
+            x_vars=["X1_Qfeed", "X2_Pfeed", "X4_TurbUFin"],
+            coef=[0.0071372, 0.31958, 0.00966531],
+            k0=-0.241168,
+            tau=15,
+            unit="MPa",
+        ),
+
+        LinearModelSpec(
+            y_name="Y3_dPUF91",
+            title="Перепад давления УФ-9.1",
+            x_vars=["X1_Qfeed", "X4_TurbUFin", "X8_DoseNaOCl", "X11_UFwashpressure"],
+            coef=[0.00075934, 0.010299, -0.00269241, -0.52987],
+            k0=0.258652,
+            tau=45,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y4_dPUF92",
+            title="Перепад давления УФ-9.2",
+            x_vars=["X1_Qfeed", "X4_TurbUFin", "X8_DoseNaOCl", "X11_UFwashpressure"],
+            coef=[0.00078108, 0.010299, -0.00269241, -0.529878],
+            k0=0.258652,
+            tau=45,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y5_dPUF93",
+            title="Перепад давления УФ-9.3",
+            x_vars=["X1_Qfeed", "X4_TurbUFin", "X8_DoseNaOCl", "X11_UFwashpressure"],
+            coef=[0.00073835, 0.00960396, -0.00250275, -0.522187],
+            k0=0.253238,
+            tau=45,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y6_dPUF94",
+            title="Перепад давления УФ-9.4",
+            x_vars=["X1_Qfeed", "X4_TurbUFin", "X8_DoseNaOCl", "X11_UFwashpressure"],
+            coef=[0.00076267, 0.010375, -0.00270522, -0.51899],
+            k0=0.264271,
+            tau=45,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y7_dPUF95",
+            title="Перепад давления УФ-9.5",
+            x_vars=["X1_Qfeed", "X4_TurbUFin", "X8_DoseNaOCl", "X11_UFwashpressure"],
+            coef=[0.00073668, 0.010416, -0.00249336, -0.527319],
+            k0=0.253238,
+            tau=45,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y8_TurbUFout",
+            title="Мутность после ультрафильтрации",
+            x_vars=["X1_Qfeed", "X4_TurbUFin", "X8_DoseNaOCl", "X11_UFwashpressure"],
+            coef=[0.00073453, 0.011074, -0.0026184, -0.520768],
+            k0=0.234476,
+            tau=45,
+            unit="NTU",
+        ),
+
+        LinearModelSpec(
+            y_name="Y9_CondRO17perm",
+            title="Электропроводность пермеата УОО-17",
+            x_vars=["X5_CondUOO2in", "X12_ROHPspeed", "X6_DoseAS", "X7_DoseMBS"],
+            coef=[0.140129, 0.011074, -0.063005, -0.0826],
+            k0=14.484512,
+            tau=90,
+            unit="uS/cm",
+        ),
+        LinearModelSpec(
+            y_name="Y10_CondRO23perm",
+            title="Электропроводность пермеата УОО-23",
+            x_vars=["X5_CondUOO2in", "X12_ROHPspeed", "X6_DoseAS", "X7_DoseMBS"],
+            coef=[0.12776, -0.05923, -0.063005, -0.075389],
+            k0=14.484512,
+            tau=90,
+            unit="uS/cm",
+        ),
+        LinearModelSpec(
+            y_name="Y11_CondRO24perm",
+            title="Электропроводность пермеата УОО-24",
+            x_vars=["X5_CondUOO2in", "X12_ROHPspeed", "X6_DoseAS", "X7_DoseMBS"],
+            coef=[0.134021, -0.060496, -0.061742, -0.078375],
+            k0=13.945176,
+            tau=90,
+            unit="uS/cm",
+        ),
+
+        LinearModelSpec(
+            y_name="Y12_dPRO17",
+            title="Перепад давления УОО-17",
+            x_vars=["X2_Pfeed", "X4_TurbUFin", "X5_CondUOO2in", "X12_ROHPspeed"],
+            coef=[0.50831, 0.005974, -0.0029369, 0.0047203],
+            k0=-0.364898,
+            tau=60,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y13_dPRO23",
+            title="Перепад давления УОО-23",
+            x_vars=["X2_Pfeed", "X4_TurbUFin", "X5_CondUOO2in", "X12_ROHPspeed"],
+            coef=[0.512839, 0.00663628, -0.00315394, 0.00461773],
+            k0=-0.372626,
+            tau=60,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y14_dPRO24",
+            title="Перепад давления УОО-24",
+            x_vars=["X2_Pfeed", "X4_TurbUFin", "X5_CondUOO2in", "X12_ROHPspeed"],
+            coef=[0.49232, 0.00556943, -0.00289616, 0.00404244],
+            k0=-0.321015,
+            tau=60,
+            unit="MPa",
+        ),
+        LinearModelSpec(
+            y_name="Y15_Recoverytotal",
+            title="Коэффициент восстановления",
+            x_vars=["X1_Qfeed", "X2_Pfeed", "X5_CondUOO2in", "X12_ROHPspeed"],
+            coef=[0.064032, 32.29287, -0.424509, 0.338466],
+            k0=33.435501,
+            tau=80,
+            unit="%",
+        ),
+        LinearModelSpec(
+            y_name="Y16_Condpermfinal",
+            title="Итоговая электропроводность пермеата",
+            x_vars=["X5_CondUOO2in", "X12_ROHPspeed", "X6_DoseAS", "X7_DoseMBS"],
+            coef=[0.13579, -0.061724, -0.060057, -0.07815],
+            k0=13.87695,
+            tau=90,
+            unit="uS/cm",
+        ),
+
+        LinearModelSpec(
+            y_name="Y17_pHfinal",
+            title="Итоговый pH",
+            x_vars=["X9_DoseNaOH", "X10_DoseHCl", "X3_TafterHX"],
+            coef=[-0.00599095, 0.033443, -0.026975],
+            k0=7.908302,
+            tau=30,
+            unit="pH",
+        ),
+
+        LinearModelSpec(
+            y_name="Y18_Qualityindex",
+            title="Интегральный показатель качества воды",
+            x_vars=["Y8_TurbUFout", "Y15_Recoverytotal", "Y16_Condpermfinal", "Y17_pHfinal"],
+            coef=[-65.075602, 0.736778, -2.605675, 8.414998],
+            k0=-8.883059,
+            tau=10,
+            unit="%",
+        ),
+    ]
+
+    return HVP2DigitalModel(models)
