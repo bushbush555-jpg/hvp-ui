@@ -397,7 +397,7 @@ c2.metric("MAPE после, %", f"{adapt_summary['MAPE_after_percent']:.3f}")
 c3.metric("K0 до", f"{adapt_summary['k0_before']:.6f}")
 c4.metric("K0 после", f"{adapt_summary['k0_after']:.6f}")
 
-    if adapt_summary["adapted"]:
+if adapt_summary["adapted"]:
         st.success("Модель была адаптирована, так как погрешность превышала допустимый порог.")
     else:
         st.info("Адаптация не выполнялась: погрешность не превышает заданный порог.")
