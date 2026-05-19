@@ -1,25 +1,55 @@
 import json
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
 
-def mape_percent(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Средняя относительная погрешность, %."""
+def mean_relative_error_percent(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Средняя относительная погрешность, %.
+
+    Расчет:
+        δср = mean(abs((Ycalc - Yexp) / Yexp)) * 100
+    """
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+
     denom = np.maximum(np.abs(y_true), 1e-9)
     return float(np.mean(np.abs((y_pred - y_true) / denom)) * 100.0)
 
 
 def relative_error_percent(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-    """Относительная погрешность по каждой точке, %."""
+    """
+    Относительная погрешность по каждой точке, %.
+    Возвращается модуль ошибки.
+    """
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+
     denom = np.maximum(np.abs(y_true), 1e-9)
     return np.abs((y_pred - y_true) / denom) * 100.0
+
+
+def signed_relative_error_percent(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    """
+    Знаковая относительная погрешность по каждой точке, %.
+    Используется для графика, чтобы было видно направление отклонения.
+    """
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+
+    denom = np.maximum(np.abs(y_true), 1e-9)
+    return (y_pred - y_true) / denom * 100.0
+
+
+def mape_percent(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Оставлено для совместимости со старой версией кода.
+    В интерфейсе выводится не как MAPE, а как средняя относительная погрешность δср, %.
+    """
+    return mean_relative_error_percent(y_true, y_pred)
 
 
 @dataclass
@@ -27,10 +57,11 @@ class LinearModelSpec:
     """
     Расчетная модель одного выходного параметра:
 
-    Y = K0 + k1*X1 + k2*X2 + ... + kn*Xn
+        Y = K0 + k1*X1 + k2*X2 + ... + kn*Xn
 
+    K0 — свободный коэффициент уравнения, полученный в Approx.
     В Simulink каждый коэффициент k дополнительно представлен
-    в виде передаточной функции k/(Ts+1).
+    передаточной функцией k/(T*s + 1), чтобы учесть инерционность процесса.
     """
 
     y_name: str
@@ -43,6 +74,7 @@ class LinearModelSpec:
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         missing = [x for x in self.x_vars if x not in df.columns]
+
         if missing:
             raise ValueError(
                 f"Для модели {self.y_name} отсутствуют столбцы: {missing}"
@@ -61,18 +93,19 @@ class LinearModelSpec:
 
     def adapt_k0(self, y_true: np.ndarray, y_pred: np.ndarray, alpha: float) -> float:
         """
-        Адаптация свободного коэффициента:
+        Корректировка свободного коэффициента K0:
 
-        K0_new = K0_old + alpha * mean(Yexp - Ycalc)
+            K0_new = K0_old + alpha * mean(Yexp - Ycalc)
 
-        Такой вариант не меняет коэффициенты при технологических входах,
-        а только корректирует смещение модели.
+        Такой вариант адаптации не изменяет коэффициенты при технологических входах,
+        а корректирует постоянное смещение модели.
         """
         y_true = np.asarray(y_true, dtype=float).reshape(-1)
         y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
 
         correction = float(np.mean(y_true - y_pred))
         self.k0 = float(self.k0 + alpha * correction)
+
         return self.k0
 
 
@@ -92,7 +125,7 @@ class HVP2DigitalModel:
         """
         Расчет всех выходов Y1...Y18.
 
-        Важно: Y18 зависит от уже рассчитанных Y8, Y15, Y16, Y17,
+        Y18 зависит от расчетных Y8, Y15, Y16, Y17,
         поэтому модели рассчитываются последовательно.
         """
         work = df.copy()
@@ -110,7 +143,7 @@ class HVP2DigitalModel:
         Расчет одного выхода.
 
         Если выбран Y18, предварительно рассчитываются выходы,
-        от которых зависит индекс качества.
+        от которых зависит интегральный показатель качества.
         """
         if y_name == "Y18_Qualityindex":
             all_y = self.predict_all(df)
@@ -126,6 +159,7 @@ class HVP2DigitalModel:
         y_true_col: str
     ) -> Dict:
         model = self.get_model(y_name)
+
         y_true = df[y_true_col].to_numpy(dtype=float)
         y_pred = self.predict_one(df, y_name)
 
@@ -136,7 +170,7 @@ class HVP2DigitalModel:
             "tau": model.tau,
             "k0": model.k0,
             "n_rows": int(len(df)),
-            "MAPE_percent": mape_percent(y_true, y_pred),
+            "mean_error_percent": mean_relative_error_percent(y_true, y_pred),
             "max_error_percent": float(np.max(relative_error_percent(y_true, y_pred))),
             "mean_Y_exp": float(np.mean(y_true)),
             "mean_Y_calc": float(np.mean(y_pred)),
@@ -156,24 +190,26 @@ class HVP2DigitalModel:
         y_pred_before = self.predict_one(df, y_name)
 
         k0_before = model.k0
-        mape_before = mape_percent(y_true, y_pred_before)
+        mean_error_before = mean_relative_error_percent(y_true, y_pred_before)
 
         adapted = False
-        if mape_before > threshold_percent:
+
+        if mean_error_before > threshold_percent:
             model.adapt_k0(y_true, y_pred_before, alpha=alpha)
             adapted = True
 
         y_pred_after = self.predict_one(df, y_name)
-        mape_after = mape_percent(y_true, y_pred_after)
+        mean_error_after = mean_relative_error_percent(y_true, y_pred_after)
 
         return {
             "Y": y_name,
             "title": model.title,
             "unit": model.unit,
+            "tau": model.tau,
             "k0_before": k0_before,
             "k0_after": model.k0,
-            "MAPE_before_percent": mape_before,
-            "MAPE_after_percent": mape_after,
+            "mean_error_before_percent": mean_error_before,
+            "mean_error_after_percent": mean_error_after,
             "adapted": adapted,
             "threshold_percent": threshold_percent,
             "alpha": alpha,
@@ -200,12 +236,86 @@ INPUT_INFO = {
 }
 
 
+INPUT_LIMITS = {
+    "X1_Qfeed": {
+        "min": 0.0,
+        "max": 500.0,
+        "unit": "м3/ч",
+        "name": "Расход исходной воды",
+    },
+    "X2_Pfeed": {
+        "min": 0.0,
+        "max": 1.6,
+        "unit": "МПа",
+        "name": "Давление исходной воды",
+    },
+    "X3_TafterHX": {
+        "min": 0.0,
+        "max": 60.0,
+        "unit": "°C",
+        "name": "Температура после теплообменника",
+    },
+    "X4_TurbUFin": {
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "NTU",
+        "name": "Мутность перед ультрафильтрацией",
+    },
+    "X5_CondUOO2in": {
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "мкСм/см",
+        "name": "Электропроводность на входе УОО",
+    },
+    "X6_DoseAS": {
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "%",
+        "name": "Дозирование антискаланта",
+    },
+    "X7_DoseMBS": {
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "%",
+        "name": "Дозирование MBS",
+    },
+    "X8_DoseNaOCl": {
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "%",
+        "name": "Дозирование NaOCl",
+    },
+    "X9_DoseNaOH": {
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "%",
+        "name": "Дозирование NaOH",
+    },
+    "X10_DoseHCl": {
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "%",
+        "name": "Дозирование HCl",
+    },
+    "X11_UFwashpressure": {
+        "min": 0.0,
+        "max": 1.0,
+        "unit": "МПа",
+        "name": "Давление промывки УФ",
+    },
+    "X12_ROHPspeed": {
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "%",
+        "name": "Скорость насосов УОО",
+    },
+}
+
+
 def create_default_hvp2_model() -> HVP2DigitalModel:
     """
     Актуальная структура моделей Y1...Y18.
-
-    Коэффициенты соответствуют последней расчетной части и схемам Simulink.
-    Если в Word/Approx будут изменены коэффициенты, править нужно здесь.
+    Коэффициенты соответствуют расчетной части и схемам Simulink.
     """
 
     models = [
@@ -227,7 +337,6 @@ def create_default_hvp2_model() -> HVP2DigitalModel:
             tau=15,
             unit="MPa",
         ),
-
         LinearModelSpec(
             y_name="Y3_dPUF91",
             title="Перепад давления УФ-9.1",
@@ -282,7 +391,6 @@ def create_default_hvp2_model() -> HVP2DigitalModel:
             tau=45,
             unit="NTU",
         ),
-
         LinearModelSpec(
             y_name="Y9_CondRO17perm",
             title="Электропроводность пермеата УОО-17",
@@ -310,7 +418,6 @@ def create_default_hvp2_model() -> HVP2DigitalModel:
             tau=90,
             unit="uS/cm",
         ),
-
         LinearModelSpec(
             y_name="Y12_dPRO17",
             title="Перепад давления УОО-17",
@@ -356,7 +463,6 @@ def create_default_hvp2_model() -> HVP2DigitalModel:
             tau=90,
             unit="uS/cm",
         ),
-
         LinearModelSpec(
             y_name="Y17_pHfinal",
             title="Итоговый pH",
@@ -366,7 +472,6 @@ def create_default_hvp2_model() -> HVP2DigitalModel:
             tau=30,
             unit="pH",
         ),
-
         LinearModelSpec(
             y_name="Y18_Qualityindex",
             title="Интегральный показатель качества воды",
