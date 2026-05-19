@@ -1,20 +1,20 @@
 import io
-import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
-
-from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 from model_core import (
     INPUT_INFO,
+    INPUT_LIMITS,
     create_default_hvp2_model,
-    mape_percent,
+    mean_relative_error_percent,
     relative_error_percent,
+    signed_relative_error_percent,
 )
 
 
@@ -26,7 +26,8 @@ st.set_page_config(
 st.title("Цифровая модель ХВП-2 — интерфейс адаптации")
 st.write(
     "Загрузка производственных данных → выбор выходного параметра → расчет по модели Approx → "
-    "оценка погрешности → адаптация свободного коэффициента K0 → экспорт результатов."
+    "оценка относительной погрешности → при необходимости адаптация свободного коэффициента K0 → "
+    "экспорт результатов."
 )
 
 
@@ -39,7 +40,9 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
 def to_numeric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     Аккуратное преобразование числовых столбцов.
-    Столбцы, которые не удалось преобразовать в числа, остаются без изменений.
+
+    Если столбец содержит числа в формате с запятой, они преобразуются в float.
+    Если столбец полностью текстовый, он остается без изменений.
     """
     out = df.copy()
 
@@ -58,8 +61,6 @@ def to_numeric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
         converted = pd.to_numeric(prepared, errors="coerce")
 
-        # Если в столбце реально есть числовые значения — используем преобразованный вариант.
-        # Если весь столбец стал NaN, оставляем исходный столбец.
         if converted.notna().sum() > 0:
             out[col] = converted
         else:
@@ -71,7 +72,7 @@ def to_numeric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 def guess_column(alias: str, columns: list) -> str:
     """
     Примерный автоподбор столбца по названию.
-    Если не угадал — пользователь вручную выберет нужный столбец.
+    Если автоподбор ошибся, пользователь вручную выбирает нужный столбец.
     """
     low_cols = {c: str(c).lower() for c in columns}
 
@@ -91,8 +92,9 @@ def guess_column(alias: str, columns: list) -> str:
     }
 
     keys = patterns.get(alias, [])
+
     for col, lc in low_cols.items():
-        if all(k in lc for k in keys[:2]) and keys:
+        if keys and all(k in lc for k in keys[:2]):
             return col
 
     for col, lc in low_cols.items():
@@ -111,79 +113,209 @@ def make_alias_dataframe(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
 
     for alias, source_col in col_map.items():
         values = df[source_col]
+
         if values.dtype == object:
             values = (
                 values.astype(str)
                 .str.replace(",", ".", regex=False)
                 .str.replace(" ", "", regex=False)
+                .str.replace("\u00a0", "", regex=False)
             )
+
         model_df[alias] = pd.to_numeric(values, errors="coerce")
 
     return model_df
 
 
-def plot_compare(y_true, y_before, y_after, y_label):
+def validate_input_ranges(model_df: pd.DataFrame, limits: dict):
+    """
+    Проверка входных параметров X1...X12 на выход за допустимые диапазоны.
+    Возвращает маску корректных строк и таблицу нарушений.
+    """
+    valid_mask = pd.Series(True, index=model_df.index)
+    report_rows = []
+
+    for alias, lim in limits.items():
+        if alias not in model_df.columns:
+            continue
+
+        values = model_df[alias]
+        bad = (values < lim["min"]) | (values > lim["max"])
+
+        if bad.any():
+            valid_mask = valid_mask & (~bad)
+
+            bad_indices = model_df.index[bad].astype(str).tolist()
+            bad_values = values[bad].head(5).tolist()
+
+            report_rows.append({
+                "Параметр": alias,
+                "Описание": lim["name"],
+                "Допустимый минимум": lim["min"],
+                "Допустимый максимум": lim["max"],
+                "Ед. изм.": lim["unit"],
+                "Количество нарушений": int(bad.sum()),
+                "Примеры строк": ", ".join(bad_indices[:10]),
+                "Примеры значений": ", ".join([str(v) for v in bad_values]),
+            })
+
+    return valid_mask, pd.DataFrame(report_rows)
+
+
+def plot_compare(y_true, y_before, y_after, y_label: str, adapted: bool):
+    """
+    График сравнения экспериментальных и расчетных значений.
+
+    Если адаптация не выполнялась, отображается только эксперимент и расчетная модель.
+    Если адаптация выполнялась, отображается эксперимент, расчет до адаптации и расчет после адаптации.
+    """
     t = np.arange(len(y_true))
 
     fig = plt.figure(figsize=(11, 5))
-    plt.plot(t, y_true, label="Эксперимент")
-    plt.plot(t, y_before, label="Модель до адаптации")
-    plt.plot(t, y_after, label="Модель после адаптации")
+
+    plt.plot(
+        t,
+        y_true,
+        label="Экспериментальные значения",
+        linestyle="-",
+        marker="o",
+        markersize=3.5,
+        linewidth=1.3
+    )
+
+    if adapted:
+        plt.plot(
+            t,
+            y_before,
+            label="Расчет до адаптации",
+            linestyle="--",
+            linewidth=1.7
+        )
+
+        plt.plot(
+            t,
+            y_after,
+            label="Расчет после адаптации",
+            linestyle="-",
+            linewidth=1.8
+        )
+    else:
+        plt.plot(
+            t,
+            y_before,
+            label="Расчетные значения модели",
+            linestyle="-",
+            linewidth=1.8
+        )
+
     plt.title(f"Сравнение экспериментальных и расчетных значений: {y_label}")
     plt.xlabel("Номер точки")
     plt.ylabel(y_label)
     plt.grid(True)
-    plt.legend()
+    plt.legend(frameon=True)
+
     return fig
 
 
-def plot_error(y_true, y_before, y_after):
+def plot_error(y_true, y_before, y_after, threshold: float, adapted: bool):
+    """
+    График знаковой относительной погрешности.
+
+    Если адаптация не выполнялась, отображается одна линия погрешности расчетной модели.
+    Если адаптация выполнялась, отображаются две линии: до и после адаптации.
+    """
     t = np.arange(len(y_true))
 
-    err_before = (y_before - y_true) / np.maximum(np.abs(y_true), 1e-9) * 100.0
-    err_after = (y_after - y_true) / np.maximum(np.abs(y_true), 1e-9) * 100.0
+    err_before = signed_relative_error_percent(y_true, y_before)
+    err_after = signed_relative_error_percent(y_true, y_after)
 
     fig = plt.figure(figsize=(11, 5))
-    plt.plot(t, err_before, label="До адаптации")
-    plt.plot(t, err_after, label="После адаптации")
-    plt.axhline(5, linestyle="--")
-    plt.axhline(-5, linestyle="--")
+
+    if adapted:
+        plt.plot(
+            t,
+            err_before,
+            label="Погрешность до адаптации",
+            linestyle="--",
+            linewidth=1.6
+        )
+
+        plt.plot(
+            t,
+            err_after,
+            label="Погрешность после адаптации",
+            linestyle="-",
+            linewidth=1.8
+        )
+    else:
+        plt.plot(
+            t,
+            err_before,
+            label="Относительная погрешность расчетной модели",
+            linestyle="-",
+            linewidth=1.8
+        )
+
+    plt.axhline(
+        threshold,
+        linestyle="--",
+        linewidth=1.2,
+        label=f"+{threshold:.1f} %"
+    )
+
+    plt.axhline(
+        -threshold,
+        linestyle="--",
+        linewidth=1.2,
+        label=f"-{threshold:.1f} %"
+    )
+
     plt.title("Относительная погрешность, %")
     plt.xlabel("Номер точки")
     plt.ylabel("δ, %")
     plt.grid(True)
-    plt.legend()
+    plt.legend(frameon=True)
+
     return fig
 
 
-def build_excel_report(summary_df, coef_df, result_df) -> bytes:
+def build_excel_report(summary_df: pd.DataFrame, coef_df: pd.DataFrame, result_df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
+
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
         coef_df.to_excel(writer, index=False, sheet_name="Coefficients")
         result_df.to_excel(writer, index=False, sheet_name="Results")
+
     buf.seek(0)
     return buf.read()
 
 
 def build_pdf_report(summary: dict) -> bytes:
+    """
+    PDF-отчет выполнен латиницей, чтобы в ReportLab не возникало проблем с кириллицей.
+    """
     pdf_path = Path("hvp2_adaptation_report.pdf")
     c = canvas.Canvas(str(pdf_path), pagesize=A4)
-    w, h = A4
+
+    _, h = A4
 
     c.setFont("Helvetica-Bold", 14)
     c.drawString(40, h - 50, "HVP-2 Digital Model Adaptation Report")
 
     c.setFont("Helvetica", 11)
+
     y = h - 85
+
     lines = [
         f"Output: {summary.get('Y', '')}",
         f"Title: {summary.get('title', '')}",
         f"Unit: {summary.get('unit', '')}",
+        f"Tau: {summary.get('tau', 0)} s",
         f"K0 before: {summary.get('k0_before', 0):.6f}",
         f"K0 after: {summary.get('k0_after', 0):.6f}",
-        f"MAPE before: {summary.get('MAPE_before_percent', 0):.4f} %",
-        f"MAPE after: {summary.get('MAPE_after_percent', 0):.4f} %",
+        f"Mean relative error before: {summary.get('mean_error_before_percent', 0):.4f} %",
+        f"Mean relative error after: {summary.get('mean_error_after_percent', 0):.4f} %",
         f"Threshold: {summary.get('threshold_percent', 0):.2f} %",
         f"Alpha: {summary.get('alpha', 0):.3f}",
         f"Adapted: {summary.get('adapted', False)}",
@@ -225,6 +357,7 @@ with st.expander("Просмотр исходных данных"):
 # -------------------- модель --------------------
 
 model = create_default_hvp2_model()
+
 model_names = [m.y_name for m in model.models]
 model_titles = {m.y_name: f"{m.y_name} — {m.title}" for m in model.models}
 
@@ -277,8 +410,40 @@ if model_df.isna().any().any():
     )
 
 valid_mask = ~model_df.isna().any(axis=1)
+
 model_df = model_df.loc[valid_mask].copy()
 df_valid = df_raw.loc[valid_mask].copy()
+
+range_valid_mask, range_report = validate_input_ranges(model_df, INPUT_LIMITS)
+
+if not range_report.empty:
+    st.warning(
+        "Обнаружены значения входных параметров, выходящие за допустимые диапазоны. "
+        "Такие строки могут привести к некорректному расчету модели."
+    )
+
+    st.dataframe(range_report, use_container_width=True)
+
+    range_action = st.radio(
+        "Что сделать со строками вне допустимых диапазонов?",
+        [
+            "Исключить некорректные строки из расчета",
+            "Остановить расчет и исправить исходные данные"
+        ]
+    )
+
+    if range_action == "Остановить расчет и исправить исходные данные":
+        st.stop()
+
+    model_df = model_df.loc[range_valid_mask].copy()
+    df_valid = df_valid.loc[range_valid_mask].copy()
+
+if len(model_df) == 0:
+    st.error(
+        "После очистки данных не осталось строк для расчета. "
+        "Проверь выбранные столбцы и диапазоны входных параметров."
+    )
+    st.stop()
 
 st.write(f"Для расчета доступно строк после очистки: **{len(model_df)}**")
 
@@ -337,9 +502,11 @@ if mode == "Только расчет выходных параметров":
     json_bytes = model.to_json_bytes()
 
     excel_buf = io.BytesIO()
+
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
         model_df.to_excel(writer, index=False, sheet_name="Input_X")
         y_all.to_excel(writer, index=False, sheet_name="Calculated_Y")
+
     excel_buf.seek(0)
 
     st.download_button(
@@ -355,6 +522,7 @@ if mode == "Только расчет выходных параметров":
         file_name="hvp2_calculated_outputs.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
 else:
     y_true_raw = df_valid[y_true_col]
 
@@ -366,22 +534,30 @@ else:
             .str.replace("\u00a0", "", regex=False)
         )
 
-    y_true = pd.to_numeric(y_true_raw, errors="coerce").to_numpy(dtype=float)
+    y_true_series = pd.to_numeric(y_true_raw, errors="coerce")
 
-    mask_y = ~np.isnan(y_true)
-    y_true = y_true[mask_y]
+    if y_true_series.isna().any():
+        st.warning(
+            "В столбце с фактическим значением Y есть пропуски или нечисловые значения. "
+            "Такие строки будут исключены из проверки."
+        )
+
+    mask_y = ~y_true_series.isna()
+
+    y_true = y_true_series.loc[mask_y].to_numpy(dtype=float)
     model_df_for_y = model_df.loc[mask_y].copy()
 
-    # Добавляем фактический Y во внутреннюю таблицу,
-    # чтобы функция adapt_one могла его найти.
+    if len(model_df_for_y) == 0:
+        st.error(
+            "После очистки фактических значений Y не осталось строк для проверки модели."
+        )
+        st.stop()
+
     model_df_for_y["_Y_EXP_"] = y_true
 
     y_before = model.predict_one(model_df_for_y, selected_y)
 
-    summary_before = {
-        "MAPE_before_percent": mape_percent(y_true, y_before),
-        "max_error_before_percent": float(np.max(relative_error_percent(y_true, y_before))),
-    }
+    mean_error_before = mean_relative_error_percent(y_true, y_before)
 
     adapt_summary = model.adapt_one(
         model_df_for_y,
@@ -393,32 +569,63 @@ else:
 
     y_after = model.predict_one(model_df_for_y, selected_y)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("MAPE до, %", f"{summary_before['MAPE_before_percent']:.3f}")
-    c2.metric("MAPE после, %", f"{adapt_summary['MAPE_after_percent']:.3f}")
-    c3.metric("K0 до", f"{adapt_summary['k0_before']:.6f}")
-    c4.metric("K0 после", f"{adapt_summary['k0_after']:.6f}")
+    mean_error_after = adapt_summary["mean_error_after_percent"]
+    adapted = adapt_summary["adapted"]
 
-    if adapt_summary["adapted"]:
-        st.success("Модель была адаптирована, так как погрешность превышала допустимый порог.")
+    if adapted:
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("δср до, %", f"{mean_error_before:.3f}")
+        c2.metric("δср после, %", f"{mean_error_after:.3f}")
+        c3.metric("K0 до", f"{adapt_summary['k0_before']:.6f}")
+        c4.metric("K0 после", f"{adapt_summary['k0_after']:.6f}")
+
+        if mean_error_after <= threshold:
+            st.success(
+                "Модель была адаптирована. После корректировки средняя относительная "
+                "погрешность находится в допустимых пределах."
+            )
+        else:
+            st.warning(
+                "Модель была адаптирована, однако средняя относительная погрешность "
+                "все еще превышает допустимый порог. Для повышения точности требуется "
+                "дальнейшее уточнение коэффициентов модели, а не только корректировка K0."
+            )
+
     else:
-        st.info("Адаптация не выполнялась: погрешность не превышает заданный порог.")
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("δср, %", f"{mean_error_before:.3f}")
+        c2.metric("Допустимый порог, %", f"{threshold:.3f}")
+        c3.metric("K0", f"{adapt_summary['k0_before']:.6f}")
+
+        st.info(
+            "Адаптация не выполнялась: средняя относительная погрешность не превышает "
+            "заданный допустимый порог."
+        )
 
     st.subheader("Графики")
 
+    y_label = f"{selected_y}, {selected_model.unit}"
+
     fig1 = plot_compare(
-        y_true,
-        y_before,
-        y_after,
-        selected_y
+        y_true=y_true,
+        y_before=y_before,
+        y_after=y_after,
+        y_label=y_label,
+        adapted=adapted
     )
+
     st.pyplot(fig1, clear_figure=True)
 
     fig2 = plot_error(
-        y_true,
-        y_before,
-        y_after
+        y_true=y_true,
+        y_before=y_before,
+        y_after=y_after,
+        threshold=threshold,
+        adapted=adapted
     )
+
     st.pyplot(fig2, clear_figure=True)
 
     st.subheader("Коэффициенты выбранной модели")
@@ -431,7 +638,7 @@ else:
     })
 
     k0_row = pd.DataFrame({
-        "input": ["K0"],
+        "input": ["K0 — свободный коэффициент"],
         "coef": [adapted_model.k0]
     })
 
@@ -439,13 +646,20 @@ else:
 
     st.dataframe(coef_df, use_container_width=True)
 
-    result_df = pd.DataFrame({
-        "Y_exp": y_true,
-        "Y_calc_before": y_before,
-        "Y_calc_after": y_after,
-        "error_before_%": relative_error_percent(y_true, y_before),
-        "error_after_%": relative_error_percent(y_true, y_after),
-    })
+    if adapted:
+        result_df = pd.DataFrame({
+            "Y_exp": y_true,
+            "Y_calc_before": y_before,
+            "Y_calc_after": y_after,
+            "rel_error_before_%": relative_error_percent(y_true, y_before),
+            "rel_error_after_%": relative_error_percent(y_true, y_after),
+        })
+    else:
+        result_df = pd.DataFrame({
+            "Y_exp": y_true,
+            "Y_calc": y_before,
+            "relative_error_%": relative_error_percent(y_true, y_before),
+        })
 
     st.subheader("Таблица результатов")
     st.dataframe(result_df.head(100), use_container_width=True)
